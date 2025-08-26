@@ -5,6 +5,7 @@ module;
 #include <android/api-level.h>
 #include <bits/sysconf.h>
 #include <jni.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/system_properties.h>
 
@@ -13,6 +14,7 @@ module;
 #include <bit>
 #include <string_view>
 #include <tuple>
+#include <vector>
 
 #include "logging.hpp"
 
@@ -61,29 +63,24 @@ inline consteval auto operator""_uarr() {
 consteval inline auto GetTrampoline() {
     if constexpr (kArch == Arch::kArm) {
         return std::make_tuple("\x00\x00\x9f\xe5\x00\xf0\x90\xe5\x78\x56\x34\x12"_uarr,
-                               // NOLINTNEXTLINE
                                uint8_t{32u}, uintptr_t{8u});
     }
     if constexpr (kArch == Arch::kArm64) {
         return std::make_tuple(
             "\x60\x00\x00\x58\x10\x00\x40\xf8\x00\x02\x1f\xd6\x78\x56\x34\x12\x78\x56\x34\x12"_uarr,
-            // NOLINTNEXTLINE
             uint8_t{44u}, uintptr_t{12u});
     }
     if constexpr (kArch == Arch::kX86) {
         return std::make_tuple("\xb8\x78\x56\x34\x12\xff\x70\x00\xc3"_uarr,
-                               // NOLINTNEXTLINE
                                uint8_t{56u}, uintptr_t{1u});
     }
     if constexpr (kArch == Arch::kX86_64) {
         return std::make_tuple("\x48\xbf\x78\x56\x34\x12\x78\x56\x34\x12\xff\x77\x00\xc3"_uarr,
-                               // NOLINTNEXTLINE
                                uint8_t{96u}, uintptr_t{2u});
     }
     if constexpr (kArch == Arch::kRiscv64) {
         return std::make_tuple(
             "\x17\x05\x00\x00\x03\x35\x05\x01\x83\x3f\x05\x00\x67\x80\x0f\x00\x78\x56\x34\x12\x78\x56\x34\x12"_uarr,
-            // NOLINTNEXTLINE
             uint8_t{84u}, uintptr_t{16u});
     }
 }
@@ -102,11 +99,28 @@ jmethodID load_class = nullptr;
 jmethodID set_accessible = nullptr;
 jclass executable = nullptr;
 
-// for proxy method
 jmethodID method_get_parameter_types = nullptr;
 jmethodID method_get_return_type = nullptr;
-// for old platform
 jmethodID path_class_loader_init = nullptr;
+
+jclass integer_class = nullptr;
+jclass long_class = nullptr;
+jclass float_class = nullptr;
+jclass double_class = nullptr;
+jclass boolean_class = nullptr;
+jclass byte_class = nullptr;
+jclass char_class = nullptr;
+jclass short_class = nullptr;
+jclass void_class = nullptr;
+jfieldID kIntTypeField = nullptr;
+jfieldID kLongTypeField = nullptr;
+jfieldID kFloatTypeField = nullptr;
+jfieldID kDoubleTypeField = nullptr;
+jfieldID kBooleanTypeField = nullptr;
+jfieldID kByteTypeField = nullptr;
+jfieldID kCharTypeField = nullptr;
+jfieldID kShortTypeField = nullptr;
+jfieldID kVoidTypeField = nullptr;
 
 constexpr auto kInternalMethods = std::make_tuple(
     &method_get_name, &method_get_declaring_class, &class_get_name, &class_get_class_loader,
@@ -118,19 +132,41 @@ std::string generated_source_name;
 std::string generated_field_name;
 std::string generated_method_name;
 
+struct TrampolinePool {
+    std::atomic<uintptr_t> base_address{0};
+    std::atomic<unsigned> index{0};
+    unsigned count_per_page;
+};
+
+TrampolinePool trampoline_pool;
+
+pthread_rwlock_t hooked_data_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+
+class ReadLock {
+public:
+    ReadLock() { pthread_rwlock_rdlock(&hooked_data_rwlock); }
+    ~ReadLock() { pthread_rwlock_unlock(&hooked_data_rwlock); }
+};
+
+class WriteLock {
+public:
+    WriteLock() { pthread_rwlock_wrlock(&hooked_data_rwlock); }
+    ~WriteLock() { pthread_rwlock_unlock(&hooked_data_rwlock); }
+};
+
 bool InitConfig(const InitInfo &info) {
     if (info.generated_class_name.empty()) {
-        LOGE("generated class name cannot be empty");
+        LOGE("Generated class name cannot be empty");
         return false;
     }
     generated_class_name = info.generated_class_name;
     if (info.generated_field_name.empty()) {
-        LOGE("generated field name cannot be empty");
+        LOGE("Generated field name cannot be empty");
         return false;
     }
     generated_field_name = info.generated_field_name;
     if (info.generated_method_name.empty()) {
-        LOGE("generated method name cannot be empty");
+        LOGE("Generated method name cannot be empty");
         return false;
     }
     generated_method_name = info.generated_method_name;
@@ -146,7 +182,7 @@ bool InitJNI(JNIEnv *env) {
         executable = JNI_NewGlobalRef(env, JNI_FindClass(env, "java/lang/reflect/AbstractMethod"));
     }
     if (!executable) {
-        LOGE("Failed to found Executable/AbstractMethod");
+        LOGE("Failed to find Executable/AbstractMethod");
         return false;
     }
 
@@ -248,6 +284,27 @@ bool InitJNI(JNIEnv *env) {
         LOGE("Failed to find AccessibleObject.setAccessible");
         return false;
     }
+
+    integer_class = JNI_NewGlobalRef(env, JNI_FindClass(env, "java/lang/Integer"));
+    long_class = JNI_NewGlobalRef(env, JNI_FindClass(env, "java/lang/Long"));
+    float_class = JNI_NewGlobalRef(env, JNI_FindClass(env, "java/lang/Float"));
+    double_class = JNI_NewGlobalRef(env, JNI_FindClass(env, "java/lang/Double"));
+    boolean_class = JNI_NewGlobalRef(env, JNI_FindClass(env, "java/lang/Boolean"));
+    byte_class = JNI_NewGlobalRef(env, JNI_FindClass(env, "java/lang/Byte"));
+    char_class = JNI_NewGlobalRef(env, JNI_FindClass(env, "java/lang/Character"));
+    short_class = JNI_NewGlobalRef(env, JNI_FindClass(env, "java/lang/Short"));
+    void_class = JNI_NewGlobalRef(env, JNI_FindClass(env, "java/lang/Void"));
+
+    kIntTypeField = JNI_GetStaticFieldID(env, integer_class, "TYPE", "Ljava/lang/Class;");
+    kLongTypeField = JNI_GetStaticFieldID(env, long_class, "TYPE", "Ljava/lang/Class;");
+    kFloatTypeField = JNI_GetStaticFieldID(env, float_class, "TYPE", "Ljava/lang/Class;");
+    kDoubleTypeField = JNI_GetStaticFieldID(env, double_class, "TYPE", "Ljava/lang/Class;");
+    kBooleanTypeField = JNI_GetStaticFieldID(env, boolean_class, "TYPE", "Ljava/lang/Class;");
+    kByteTypeField = JNI_GetStaticFieldID(env, byte_class, "TYPE", "Ljava/lang/Class;");
+    kCharTypeField = JNI_GetStaticFieldID(env, char_class, "TYPE", "Ljava/lang/Class;");
+    kShortTypeField = JNI_GetStaticFieldID(env, short_class, "TYPE", "Ljava/lang/Class;");
+    kVoidTypeField = JNI_GetStaticFieldID(env, void_class, "TYPE", "Ljava/lang/Class;");
+
     return true;
 }
 
@@ -308,10 +365,15 @@ bool InitNative(JNIEnv *env, const HookHandler &handler) {
         return false;
     }
 
-    // This should always be the last one
+    const size_t kPageSize = sysconf(_SC_PAGESIZE);
+    trampoline_pool.count_per_page = kPageSize / kTrampolineSize;
+
+    if (pthread_rwlock_init(&hooked_data_rwlock, nullptr) != 0) {
+        LOGE("Failed to initialize rwlock");
+        return false;
+    }
+
     if (IsJavaDebuggable(env)) {
-        // Make the runtime non-debuggable as a workaround
-        // when ShouldUseInterpreterEntrypoint inlined
         Runtime::Current()->SetJavaDebuggable(Runtime::RuntimeDebugState::kNonJavaDebuggable);
     }
     return true;
@@ -322,7 +384,6 @@ std::tuple<jclass, jfieldID, jmethodID, jmethodID> BuildDex(JNIEnv *env, jobject
                                                             std::string_view method_name,
                                                             std::string_view hooker_class,
                                                             std::string_view callback_name) {
-    // NOLINTNEXTLINE
     using namespace startop::dex;
 
     if (shorty.empty()) {
@@ -336,7 +397,7 @@ std::tuple<jclass, jfieldID, jmethodID, jmethodID> BuildDex(JNIEnv *env, jobject
     parameter_types.reserve(shorty.size() - 1);
     auto return_type =
         shorty[0] == 'L' ? TypeDescriptor::Object : TypeDescriptor::FromDescriptor(shorty[0]);
-    if (!is_static) parameter_types.push_back(TypeDescriptor::Object);  // this object
+    if (!is_static) parameter_types.push_back(TypeDescriptor::Object);
     for (const char &param : shorty.substr(1)) {
         parameter_types.push_back(param == 'L'
                                       ? TypeDescriptor::Object
@@ -355,7 +416,6 @@ std::tuple<jclass, jfieldID, jmethodID, jmethodID> BuildDex(JNIEnv *env, jobject
     auto hook_builder{cbuilder.CreateMethod(
         generated_method_name == "{target}"sv ? method_name.data() : generated_method_name,
         Prototype{return_type, parameter_types})};
-    // allocate tmp first because of wide
     auto tmp{hook_builder.AllocRegister()};
     hook_builder.BuildConst(tmp, static_cast<int>(parameter_types.size()));
     auto hook_params_array{hook_builder.AllocRegister()};
@@ -397,11 +457,11 @@ std::tuple<jclass, jfieldID, jmethodID, jmethodID> BuildDex(JNIEnv *env, jobject
         LiveRegister zero = backup_builder.AllocRegister();
         LiveRegister zero_wide = backup_builder.AllocRegister();
         backup_builder.BuildConstWide(zero, 0);
-        backup_builder.BuildReturn(zero, /*is_object=*/false, true);
+        backup_builder.BuildReturn(zero, false, true);
     } else {
         LiveRegister zero = backup_builder.AllocRegister();
         backup_builder.BuildConst(zero, 0);
-        backup_builder.BuildReturn(zero, /*is_object=*/!return_type.is_primitive(), false);
+        backup_builder.BuildReturn(zero, !return_type.is_primitive(), false);
     }
     auto *backup_method = backup_builder.Encode();
 
@@ -465,105 +525,88 @@ std::tuple<jclass, jfieldID, jmethodID, jmethodID> BuildDex(JNIEnv *env, jobject
 
 static_assert(std::endian::native == std::endian::little, "Unsupported architecture");
 
-union Trampoline {
-public:
+union TrampolinePtr {
     uintptr_t address;
     unsigned count4k : 12;
     unsigned count16k : 14;
 };
 
-static_assert(sizeof(Trampoline) == sizeof(uintptr_t), "Unsupported architecture");
+static_assert(sizeof(TrampolinePtr) == sizeof(uintptr_t), "Unsupported architecture");
 static_assert(std::atomic_uintptr_t::is_always_lock_free, "Unsupported architecture");
 
-std::atomic_uintptr_t trampoline_pool{0};
-std::atomic_flag trampoline_lock{false};
 constexpr size_t kTrampolineSize = RoundUpTo(sizeof(trampoline), kPointerSize);
 constexpr uintptr_t kAddressMask = 0xFFFU;
 
 void *GenerateTrampolineFor(art::ArtMethod *hook) {
-    static const size_t kPageSize = sysconf(_SC_PAGESIZE);  // assume
-    static const size_t kTrampolineNumPerPage = kPageSize / kTrampolineSize;
-    unsigned count;
-    uintptr_t address;
-    while (true) {
-        auto tl = Trampoline{.address = trampoline_pool.fetch_add(1, std::memory_order_release)};
-        count = kPageSize == 16384 ? tl.count16k : tl.count4k;
-        address = tl.address & ~kAddressMask;
-        if (address == 0 || count >= kTrampolineNumPerPage) {
-            if (trampoline_lock.test_and_set(std::memory_order_acq_rel)) {
-                trampoline_lock.wait(true, std::memory_order_acquire);
-                continue;
-            }
-            address = reinterpret_cast<uintptr_t>(mmap(nullptr, kPageSize,
-                                                       PROT_READ | PROT_WRITE | PROT_EXEC,
-                                                       MAP_ANONYMOUS | MAP_PRIVATE, -1, 0));
-            if (address == reinterpret_cast<uintptr_t>(MAP_FAILED)) {
-                PLOGE("mmap trampoline");
-                trampoline_lock.clear(std::memory_order_release);
-                trampoline_lock.notify_all();
-                return nullptr;
-            }
-            count = 0;
-            tl.address = address;
-            kPageSize == 16384 ? tl.count16k = count + 1 : tl.count4k = count + 1;
-            trampoline_pool.store(tl.address, std::memory_order_release);
-            trampoline_lock.clear(std::memory_order_release);
-            trampoline_lock.notify_all();
+    unsigned index = trampoline_pool.index.fetch_add(1, std::memory_order_relaxed);
+    unsigned page_index = index / trampoline_pool.count_per_page;
+    unsigned offset_in_page = index % trampoline_pool.count_per_page;
+    
+    if (offset_in_page == 0) {
+        const size_t kPageSize = sysconf(_SC_PAGESIZE);
+        uintptr_t new_page = reinterpret_cast<uintptr_t>(mmap(
+            nullptr, kPageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+            MAP_ANONYMOUS | MAP_PRIVATE, -1, 0));
+        
+        if (new_page == reinterpret_cast<uintptr_t>(MAP_FAILED)) {
+            PLOGE("mmap trampoline page");
+            return nullptr;
         }
-        LOGV("trampoline: count = %u, address = %zx, target = %zx", count, address,
-             address + count * kTrampolineSize);
-        address = address + count * kTrampolineSize;
-        break;
+        
+        uintptr_t expected = 0;
+        if (!trampoline_pool.base_address.compare_exchange_strong(
+                expected, new_page, std::memory_order_release, std::memory_order_relaxed)) {
+            munmap(reinterpret_cast<void*>(new_page), kPageSize);
+        }
     }
-    auto *address_ptr = reinterpret_cast<char *>(address);
-    std::memcpy(address_ptr, trampoline.data(), trampoline.size());
-
-    *reinterpret_cast<art::ArtMethod **>(address_ptr + art_method_offset) = hook;
-
-    __builtin___clear_cache(address_ptr, reinterpret_cast<char *>(address + trampoline.size()));
-
-    return address_ptr;
+    
+    uintptr_t page_base = trampoline_pool.base_address.load(std::memory_order_acquire);
+    if (page_base == 0) {
+        return nullptr;
+    }
+    
+    uintptr_t trampoline_addr = page_base + page_index * sysconf(_SC_PAGESIZE) + offset_in_page * kTrampolineSize;
+    void* trampoline = reinterpret_cast<void*>(trampoline_addr);
+    
+    std::memcpy(trampoline, trampoline.data(), trampoline.size());
+    *reinterpret_cast<art::ArtMethod**>(
+        reinterpret_cast<char*>(trampoline) + art_method_offset) = hook;
+    
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(trampoline),
+        reinterpret_cast<char*>(trampoline) + trampoline.size());
+    
+    return trampoline;
 }
 
 bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
+    void* entrypoint = GenerateTrampolineFor(hook);
+    if (!entrypoint) {
+        LOGE("Failed to generate trampoline");
+        return false;
+    }
+    
     ScopedGCCriticalSection section(art::Thread::Current(), art::gc::kGcCauseDebugger,
                                     art::gc::kCollectorTypeDebugger);
     ScopedSuspendAll suspend("LSPlant Hook", false);
-    LOGV("Hooking: target = %s(%p), hook = %s(%p), backup = %s(%p)", target->PrettyMethod().c_str(),
-         target, hook->PrettyMethod().c_str(), hook, backup->PrettyMethod().c_str(), backup);
 
-    if (auto *entrypoint = GenerateTrampolineFor(hook); !entrypoint) {
-        LOGE("Failed to generate trampoline");
-        return false;
-        // NOLINTNEXTLINE
-    } else {
-        LOGV("Generated trampoline %p", entrypoint);
+    target->BackupTo(backup);
+    target->SetNonCompilable();
+    target->SetEntryPoint(entrypoint);
 
-        target->BackupTo(backup);
-
-        target->SetNonCompilable();
-
-        target->SetEntryPoint(entrypoint);
-
-        LOGV("Done hook: target(%p:0x%x) -> %p; backup(%p:0x%x) -> %p; hook(%p:0x%x) -> %p", target,
-             target->GetAccessFlags(), target->GetEntryPoint(), backup, backup->GetAccessFlags(),
-             backup->GetEntryPoint(), hook, hook->GetAccessFlags(), hook->GetEntryPoint());
-
-        return true;
-    }
+    return true;
 }
 
 bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
+    auto access_flags = target->GetAccessFlags();
+    
     ScopedGCCriticalSection section(art::Thread::Current(), art::gc::kGcCauseDebugger,
                                     art::gc::kCollectorTypeDebugger);
-    ScopedSuspendAll suspend("LSPlant Hook", false);
-    LOGV("Unhooking: target = %p, backup = %p", target, backup);
-    auto access_flags = target->GetAccessFlags();
+    ScopedSuspendAll suspend("LSPlant UnHook", false);
+
     target->CopyFrom(backup);
     target->SetAccessFlags(access_flags);
-    LOGV("Done unhook: target(%p:0x%x) -> %p; backup(%p:0x%x) -> %p;", target,
-         target->GetAccessFlags(), target->GetEntryPoint(), backup, backup->GetAccessFlags(),
-         backup->GetEntryPoint());
+    
     return true;
 }
 
@@ -571,33 +614,6 @@ std::string GetProxyMethodShorty(JNIEnv *env, jobject proxy_method) {
     const auto return_type = JNI_CallObjectMethod(env, proxy_method, method_get_return_type);
     const auto parameter_types =
         JNI_Cast<jobjectArray>(JNI_CallObjectMethod(env, proxy_method, method_get_parameter_types));
-    auto integer_class = JNI_FindClass(env, "java/lang/Integer");
-    auto long_class = JNI_FindClass(env, "java/lang/Long");
-    auto float_class = JNI_FindClass(env, "java/lang/Float");
-    auto double_class = JNI_FindClass(env, "java/lang/Double");
-    auto boolean_class = JNI_FindClass(env, "java/lang/Boolean");
-    auto byte_class = JNI_FindClass(env, "java/lang/Byte");
-    auto char_class = JNI_FindClass(env, "java/lang/Character");
-    auto short_class = JNI_FindClass(env, "java/lang/Short");
-    auto void_class = JNI_FindClass(env, "java/lang/Void");
-    static auto *kIntTypeField =
-        JNI_GetStaticFieldID(env, integer_class, "TYPE", "Ljava/lang/Class;");
-    static auto *kLongTypeField =
-        JNI_GetStaticFieldID(env, long_class, "TYPE", "Ljava/lang/Class;");
-    static auto *kFloatTypeField =
-        JNI_GetStaticFieldID(env, float_class, "TYPE", "Ljava/lang/Class;");
-    static auto *kDoubleTypeField =
-        JNI_GetStaticFieldID(env, double_class, "TYPE", "Ljava/lang/Class;");
-    static auto *kBooleanTypeField =
-        JNI_GetStaticFieldID(env, boolean_class, "TYPE", "Ljava/lang/Class;");
-    static auto *kByteTypeField =
-        JNI_GetStaticFieldID(env, byte_class, "TYPE", "Ljava/lang/Class;");
-    static auto *kCharTypeField =
-        JNI_GetStaticFieldID(env, char_class, "TYPE", "Ljava/lang/Class;");
-    static auto *kShortTypeField =
-        JNI_GetStaticFieldID(env, short_class, "TYPE", "Ljava/lang/Class;");
-    static auto *kVoidTypeField =
-        JNI_GetStaticFieldID(env, void_class, "TYPE", "Ljava/lang/Class;");
 
     auto int_type = JNI_GetStaticObjectField(env, integer_class, kIntTypeField);
     auto long_type = JNI_GetStaticObjectField(env, long_class, kLongTypeField);
@@ -647,11 +663,11 @@ using ::lsplant::IsHooked;
 [[maybe_unused]] jobject Hook(JNIEnv *env, jobject target_method, jobject hooker_object,
                               jobject callback_method) {
     if (!target_method || !JNI_IsInstanceOf(env, target_method, executable)) {
-        LOGE("target method is not an executable");
+        LOGE("Target method is not an executable");
         return nullptr;
     }
     if (!callback_method || !JNI_IsInstanceOf(env, callback_method, executable)) {
-        LOGE("callback method is not an executable");
+        LOGE("Callback method is not an executable");
         return nullptr;
     }
 
@@ -666,9 +682,12 @@ using ::lsplant::IsHooked;
     auto *target = ArtMethod::FromReflectedMethod(env, target_method);
     bool is_static = target->IsStatic();
 
-    if (IsHooked(target, true)) {
-        LOGW("Skip duplicate hook");
-        return nullptr;
+    {
+        ReadLock lock;
+        if (IsHooked(target, true)) {
+            LOGD("Skip duplicate hook");
+            return nullptr;
+        }
     }
 
     ScopedLocalRef<jclass> built_class{env};
@@ -687,14 +706,14 @@ using ::lsplant::IsHooked;
             JNI_Cast<jstring>(JNI_CallObjectMethod(env, callback_class, class_get_name));
         JUTFString class_name(callback_class_name);
         if (!JNI_IsInstanceOf(env, hooker_object, callback_class)) {
-            LOGE("callback_method is not a method of hooker_object");
+            LOGE("Callback method is not a method of hooker object");
             return nullptr;
         }
         std::tie(built_class, hooker_field, hook_method, backup_method) = WrapScope(
             env,
             BuildDex(env, callback_class_loader.get(),
-                     __builtin_expect(is_proxy, 0) ? GetProxyMethodShorty(env, target_method)
-                                                   : ArtMethod::GetMethodShorty(env, target_method),
+                     is_proxy ? GetProxyMethodShorty(env, target_method)
+                              : ArtMethod::GetMethodShorty(env, target_method),
                      is_static, target->IsConstructor() ? "constructor" : target_method_name.get(),
                      class_name.get(), callback_method_name.get()));
         if (!built_class || !hooker_field || !hook_method || !backup_method) {
@@ -714,21 +733,22 @@ using ::lsplant::IsHooked;
     JNI_SetStaticObjectField(env, built_class, hooker_field, hooker_object);
 
     if (DoHook(target, hook, backup)) {
+        WriteLock lock;
+        if (IsHooked(target, true)) {
+            LOGD("Skip duplicate hook (race condition)");
+            return nullptr;
+        }
+        
         std::apply(
             [backup_method, target_method_id = env->FromReflectedMethod(target_method)](auto... v) {
-                ((*v == target_method_id &&
-                  (LOGD("Propagate internal used method because of hook"), *v = backup_method)) ||
-                 ...);
+                ((*v == target_method_id && (*v = backup_method)) || ...);
             },
             kInternalMethods);
         jobject global_backup = JNI_NewGlobalRef(env, reflected_backup);
         RecordHooked(target, target->GetDeclaringClass()->GetClassDef(), global_backup, backup);
-        if (!is_proxy) [[likely]] {
+        if (!is_proxy) {
             RecordJitMovement(target, backup);
         }
-        // Always record backup as deoptimized since we dont want its entrypoint to be updated
-        // by FixupStaticTrampolines on hooker class
-        // Used hook's declaring class here since backup's is no longer the same with hook's
         RecordDeoptimized(hook->GetDeclaringClass()->GetClassDef(), backup);
         return global_backup;
     }
@@ -738,33 +758,35 @@ using ::lsplant::IsHooked;
 
 [[maybe_unused]] bool UnHook(JNIEnv *env, jobject target_method) {
     if (!target_method || !JNI_IsInstanceOf(env, target_method, executable)) {
-        LOGE("target method is not an executable");
+        LOGE("Target method is not an executable");
         return false;
     }
     auto *target = ArtMethod::FromReflectedMethod(env, target_method);
     jobject reflected_backup = nullptr;
     art::ArtMethod *backup = nullptr;
-    if (!hooked_methods_.erase_if(target, [&reflected_backup, &backup](const auto &it) {
-            std::tie(reflected_backup, backup) = it.second;
-            return reflected_backup != nullptr;
-        })) {
-        LOGE("Unable to unhook a method that is not hooked");
-        return false;
+    
+    {
+        WriteLock lock;
+        if (!hooked_methods_.erase_if(target, [&reflected_backup, &backup](const auto &it) {
+                std::tie(reflected_backup, backup) = it.second;
+                return reflected_backup != nullptr;
+            })) {
+            LOGE("Unable to unhook a method that is not hooked");
+            return false;
+        }
+        hooked_methods_.erase(backup);
+        hooked_classes_.erase_if(target->GetDeclaringClass()->GetClassDef(), [&target](auto &it) {
+            it.second.erase(target);
+            return it.second.empty();
+        });
     }
-    // FIXME: not atomic, but should be fine
-    hooked_methods_.erase(backup);
-    hooked_classes_.erase_if(target->GetDeclaringClass()->GetClassDef(), [&target](auto &it) {
-        it.second.erase(target);
-        return it.second.empty();
-    });
+    
     auto *backup_method = env->FromReflectedMethod(reflected_backup);
     env->DeleteGlobalRef(reflected_backup);
     if (DoUnHook(target, backup)) {
         std::apply(
             [backup_method, target_method_id = env->FromReflectedMethod(target_method)](auto... v) {
-                ((*v == backup_method && (LOGD("Propagate internal used method because of unhook"),
-                                          *v = target_method_id)) ||
-                 ...);
+                ((*v == backup_method && (*v = target_method_id)) || ...);
             },
             kInternalMethods);
         return true;
@@ -774,21 +796,24 @@ using ::lsplant::IsHooked;
 
 [[maybe_unused]] bool IsHooked(JNIEnv *env, jobject method) {
     if (!method || !JNI_IsInstanceOf(env, method, executable)) {
-        LOGE("method is not an executable");
+        LOGE("Method is not an executable");
         return false;
     }
     auto *art_method = ArtMethod::FromReflectedMethod(env, method);
+    ReadLock lock;
     return IsHooked(art_method);
 }
 
 [[maybe_unused]] bool Deoptimize(JNIEnv *env, jobject method) {
     if (!method || !JNI_IsInstanceOf(env, method, executable)) {
-        LOGE("method is not an executable");
+        LOGE("Method is not an executable");
         return false;
     }
     auto *art_method = ArtMethod::FromReflectedMethod(env, method);
-    // record the original but not the backup
-    RecordDeoptimized(art_method->GetDeclaringClass()->GetClassDef(), art_method);
+    {
+        WriteLock lock;
+        RecordDeoptimized(art_method->GetDeclaringClass()->GetClassDef(), art_method);
+    }
     if (auto *backup = IsHooked(art_method); backup) {
         art_method = backup;
     }
@@ -800,12 +825,12 @@ using ::lsplant::IsHooked;
 
 [[maybe_unused]] void *GetNativeFunction(JNIEnv *env, jobject method) {
     if (!method || !JNI_IsInstanceOf(env, method, executable)) {
-        LOGE("method is not an executable");
+        LOGE("Method is not an executable");
         return nullptr;
     }
     auto *art_method = ArtMethod::FromReflectedMethod(env, method);
     if (!art_method->IsNative()) {
-        LOGE("method is not native");
+        LOGE("Method is not native");
         return nullptr;
     }
     return art_method->GetData();
@@ -813,7 +838,7 @@ using ::lsplant::IsHooked;
 
 [[maybe_unused]] bool MakeClassInheritable(JNIEnv *env, jclass target) {
     if (!target) {
-        LOGE("target class is null");
+        LOGE("Target class is null");
         return false;
     }
     const auto constructors =
